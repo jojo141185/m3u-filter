@@ -1,3 +1,4 @@
+use crate::m3u_filter_error::{create_m3u_filter_error_result, info_err, notify_err};
 use crate::m3u_filter_error::{M3uFilterError, M3uFilterErrorKind};
 use crate::model::api_proxy::{ApiProxyServerInfo, ProxyType, ProxyUserCredentials};
 use crate::model::config::{Config, ConfigTarget, TargetOutput};
@@ -13,7 +14,6 @@ use crate::repository::xtream_repository::{xtream_get_record_file_path, InputVod
 use crate::utils::file::file_lock_manager::FileReadGuard;
 use crate::utils::file::file_utils;
 use crate::utils::network::request::extract_extension_from_url;
-use crate::m3u_filter_error::{create_m3u_filter_error_result, info_err, notify_err};
 use async_std::fs::{create_dir_all, read_dir, remove_dir, remove_file, File};
 use async_std::io::{BufReadExt, BufReader, BufWriter, ReadExt, WriteExt};
 use chrono::Datelike;
@@ -191,7 +191,7 @@ async fn kodi_style_rename(
                 input_tmdb_indexes,
                 strm_item_info.item_type,
             )
-                .await
+            .await
         }
         _ => None,
     } {
@@ -253,7 +253,7 @@ async fn kodi_style_rename(
             underscore_whitespace,
         );
         if !filename.iter().any(|e| e.contains(&sanitized_value)) {
-            filename.push(format!("{separator}-{separator}{sanitized_value}", ));
+            filename.push(format!("{separator}-{separator}{sanitized_value}",));
         }
     }
 
@@ -495,54 +495,64 @@ async fn cleanup_strm_output_directory(
     Ok(())
 }
 
-async fn remove_empty_dirs(root_path: async_std::path::PathBuf) -> Result<(), String> {
-    let mut stack = vec![root_path];
+pub async fn remove_empty_dirs(root_path: async_std::path::PathBuf) -> Result<(), String> {
+    let mut stack = vec![root_path.clone()];
     let mut dirs_to_delete = Vec::new();
-    let mut ignore_root = true;
+    let mut ignore_root = true; // Ensure the root directory is never deleted
 
     while let Some(dir) = stack.pop() {
         let mut entries = match read_dir(&dir).await {
             Ok(entries) => entries,
             Err(err) => {
-                error!("Error reading directory {dir:?}: {err}");
+                error!("Error reading directory {:?}: {}", dir, err);
                 continue;
             }
         };
 
-        let mut has_files = false;
+        let mut has_files_or_dirs = false;
+        let mut subdirs = Vec::new();
 
         while let Some(entry) = entries.next().await {
             match entry {
                 Ok(entry) => {
-                    if entry
-                        .file_type()
-                        .await
-                        .map_err(|e| format!("Failed to get file type for {entry:?}: {e}"))?
-                        .is_dir()
-                    {
-                        stack.push(entry.path());
+                    let file_type = match entry.file_type().await {
+                        Ok(ft) => ft,
+                        Err(e) => {
+                            error!("Failed to get file type for {:?}: {}", entry.path(), e);
+                            continue;
+                        }
+                    };
+
+                    if file_type.is_dir() {
+                        subdirs.push(entry.path());
                     } else {
-                        has_files = true;
+                        has_files_or_dirs = true; // Found a file, so directory is not empty
                     }
                 }
                 Err(err) => {
-                    error!("Error retrieving directory entry: {dir:?} {err}");
+                    error!("Error retrieving directory entry {:?}: {}", dir, err);
                 }
             }
         }
 
-        if !ignore_root && !has_files {
-            dirs_to_delete.push(dir);
+        // If no files were found but subdirectories exist, push them onto the stack
+        if !has_files_or_dirs {
+            if !subdirs.is_empty() {
+                stack.extend(subdirs); // Process subdirectories first
+            } else if !ignore_root {
+                dirs_to_delete.push(dir); // Directory is truly empty and safe to delete
+            }
         }
-        ignore_root = false;
+
+        ignore_root = false; // Ensure root_path is never deleted
     }
 
     // Delete directories from bottom to top
     for dir in dirs_to_delete.into_iter().rev() {
-        if dir.exists().await {
-            if let Err(e) = remove_dir(&dir).await {
-                debug!("Failed to remove empty directory {dir:?}: {e}");
-            }
+        if let Err(e) = remove_dir(&dir).await {
+            debug!("Failed to remove empty directory {:?}: {}", dir, e);
+        } else {
+            debug!("Successfully removed empty directory {:?}", dir);
         }
     }
 
@@ -609,7 +619,7 @@ async fn prepare_strm_files(
                     &mut input_tmdb_indexes,
                     underscore_whitespace,
                 )
-                    .await
+                .await
             } else {
                 let dir_path = root_path.join(sanitize_for_filename(
                     &strm_item_info.group,
@@ -664,7 +674,12 @@ pub async fn kodi_write_strm_playlist(
 
     let Some(root_path) = file_utils::get_file_path(
         &cfg.working_dir,
-        Some(std::path::PathBuf::from(&output.filename.as_ref().map_or_else(|| "/tmp", |v| v.as_ref()))),
+        Some(std::path::PathBuf::from(
+            &output
+                .filename
+                .as_ref()
+                .map_or_else(|| "/tmp", |v| v.as_ref()),
+        )),
     ) else {
         return Err(info_err!(format!(
             "Failed to get file path for {}",
@@ -706,7 +721,7 @@ pub async fn kodi_write_strm_playlist(
         underscore_whitespace,
         kodi_style,
     )
-        .await;
+    .await;
     for strm_file in strm_files {
         // file paths
         let output_path = root_path.join(&strm_file.dir_path);
@@ -738,7 +753,7 @@ pub async fn kodi_write_strm_playlist(
             content_as_bytes,
             strm_file.strm_info.get_file_ts(),
         )
-            .await
+        .await
         {
             Ok(()) => {
                 processed_strm.insert(relative_file_path);
