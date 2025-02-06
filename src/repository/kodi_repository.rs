@@ -439,12 +439,56 @@ async fn prepare_strm_output_directory(path: &Path) -> Result<(), M3uFilterError
     }
     Ok(())
 }
+/// Recursively get all files in the directory and its subdirectories.
+async fn get_files_in_directory(root_path: &Path) -> Result<HashSet<String>, String> {
+    let mut found_files = HashSet::new();
+
+    // Read the directory and traverse all subdirectories
+    let mut entries = read_dir(root_path)
+        .await
+        .map_err(|e| format!("Failed to read directory {root_path:?}: {e}"))?;
+
+    while let Some(entry) = entries.next().await {
+        match entry {
+            Ok(entry) => {
+                let file_type = entry
+                    .file_type()
+                    .await
+                    .map_err(|e| format!("Failed to get file type for {entry:?}: {e}"))?;
+
+                if file_type.is_dir() {
+                    // If it's a subdirectory, call the function recursively (box the future)
+                    let subdir = entry.path();
+                    let subdir_files = Box::pin(get_files_in_directory(subdir.as_path().into()));
+                    let subdir_files = subdir_files.await?;
+                    found_files.extend(subdir_files); // Add files from the subdirectory
+                } else if let Some(file_name) = entry
+                    .path()
+                    .strip_prefix(root_path)
+                    .ok()
+                    .and_then(|p| p.to_str())
+                {
+                    found_files.insert(file_name.to_string()); // Add the file to the set
+                }
+            }
+            Err(e) => {
+                eprintln!("Error retrieving directory entry: {e}");
+            }
+        }
+    }
+
+    Ok(found_files)
+}
+
+/// Cleanup the STRM output directory by removing files not in `processed`.
+/// Also removes empty directories after the files are deleted.
 async fn cleanup_strm_output_directory(
     cleanup: bool,
     root_path: &Path,
     existing: &HashSet<String>,
     processed: &HashSet<String>,
 ) -> Result<(), String> {
+    // Check if the root directory exists and is a valid directory
     if !(root_path.exists() && root_path.is_dir()) {
         return Err(format!(
             "Error: STRM directory does not exist: {root_path:?}"
@@ -452,36 +496,17 @@ async fn cleanup_strm_output_directory(
     }
 
     let to_remove: HashSet<String> = if cleanup {
-        // Remove al files which are not in `processed`
-        let mut found_files = HashSet::new();
+        // If cleanup is true, remove files not in `processed`
+        let found_files = get_files_in_directory(root_path).await?;
 
-        let mut entries = read_dir(root_path)
-            .await
-            .map_err(|e| format!("Failed to read directory {root_path:?}: {e}"))?;
-        while let Some(entry) = entries.next().await {
-            let entry = entry.map_err(|e| format!("Error retrieving directory entry: {e}"))?;
-            if entry
-                .file_type()
-                .await
-                .map_err(|e| format!("Failed to get file type for {entry:?}: {e}"))?
-                .is_file()
-            {
-                if let Some(file_name) = entry
-                    .path()
-                    .strip_prefix(root_path)
-                    .ok()
-                    .and_then(|p| p.to_str())
-                {
-                    found_files.insert(file_name.to_string());
-                }
-            }
-        }
+        // Calculate files to remove (files in found_files but not in processed)
         &found_files - processed
     } else {
-        // Remove all files from `existing`, which are not in `processed`
+        // If cleanup is false, remove files in `existing` not in `processed`
         existing - processed
     };
 
+    // Remove files that are in the `to_remove` set
     for file in &to_remove {
         let file_path = root_path.join(file);
         if let Err(err) = remove_file(&file_path).await {
@@ -489,18 +514,22 @@ async fn cleanup_strm_output_directory(
         }
     }
 
-    // TODO should we delete all empty directories if cleanup=false ?
+    // After file removal, remove any empty directories
     remove_empty_dirs(root_path.into()).await?;
 
     Ok(())
 }
 
 pub async fn remove_empty_dirs(root_path: async_std::path::PathBuf) -> Result<(), String> {
+    // Start with the root directory and check its contents
     let mut stack = vec![root_path.clone()];
-    let mut dirs_to_delete = Vec::new();
-    let mut ignore_root = true; // Ensure the root directory is never deleted
 
     while let Some(dir) = stack.pop() {
+        // Skip the root directory if it's empty (we never delete it)
+        if dir == root_path {
+            continue;
+        }
+
         let mut entries = match read_dir(&dir).await {
             Ok(entries) => entries,
             Err(err) => {
@@ -509,9 +538,9 @@ pub async fn remove_empty_dirs(root_path: async_std::path::PathBuf) -> Result<()
             }
         };
 
-        let mut has_files_or_dirs = false;
-        let mut subdirs = Vec::new();
+        let mut is_empty = true;
 
+        // Check if the directory contains any files or subdirectories
         while let Some(entry) = entries.next().await {
             match entry {
                 Ok(entry) => {
@@ -524,9 +553,9 @@ pub async fn remove_empty_dirs(root_path: async_std::path::PathBuf) -> Result<()
                     };
 
                     if file_type.is_dir() {
-                        subdirs.push(entry.path());
+                        stack.push(entry.path()); // Push subdirectories to stack for later processing
                     } else {
-                        has_files_or_dirs = true; // Found a file, so directory is not empty
+                        is_empty = false; // Found a file, so directory is not empty
                     }
                 }
                 Err(err) => {
@@ -535,24 +564,13 @@ pub async fn remove_empty_dirs(root_path: async_std::path::PathBuf) -> Result<()
             }
         }
 
-        // If no files were found but subdirectories exist, push them onto the stack
-        if !has_files_or_dirs {
-            if !subdirs.is_empty() {
-                stack.extend(subdirs); // Process subdirectories first
-            } else if !ignore_root {
-                dirs_to_delete.push(dir); // Directory is truly empty and safe to delete
+        // If the directory is empty, attempt to delete it
+        if is_empty && dir != root_path {
+            if let Err(e) = remove_dir(&dir).await {
+                debug!("Failed to remove empty directory {:?}: {}", dir, e);
+            } else {
+                debug!("Successfully removed empty directory {:?}", dir);
             }
-        }
-
-        ignore_root = false; // Ensure root_path is never deleted
-    }
-
-    // Delete directories from bottom to top
-    for dir in dirs_to_delete.into_iter().rev() {
-        if let Err(e) = remove_dir(&dir).await {
-            debug!("Failed to remove empty directory {:?}: {}", dir, e);
-        } else {
-            debug!("Successfully removed empty directory {:?}", dir);
         }
     }
 
